@@ -1,10 +1,12 @@
 import argparse
 import logging
 import math
+import itertools
 import os
 import random
 from pathlib import Path
 from typing import Iterable, Optional
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -46,6 +48,14 @@ def parse_args():
             " or to a folder containing files that 🤗 Datasets can understand."
         ),
     )
+    parser.add_argument(
+        "--pretrained_vae_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained vae or vae identifier from huggingface.co/models.",
+    )
+    parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
     parser.add_argument(
         "--dataset_config_name",
         type=str,
@@ -313,6 +323,12 @@ def main():
         level=logging.INFO,
     )
 
+    if args.train_text_encoder and args.gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
+        raise ValueError(
+            "Gradient accumulation is not supported when training the text encoder in distributed training. "
+            "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
+        )
+
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
@@ -337,15 +353,18 @@ def main():
     # Load models and create wrapper for stable diffusion
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
+    vae = AutoencoderKL.from_pretrained(args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path, use_auth_token=True)
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    if not args.train_text_encoder:
+        text_encoder.requires_grad_(False)
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+        if args.train_text_encoder:
+            text_encoder.gradient_checkpointing_enable()
 
     if args.scale_lr:
         args.learning_rate = (
@@ -365,8 +384,11 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    params_to_optimize = (
+        itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
+    )
     optimizer = optimizer_cls(
-        unet.parameters(),
+        params_to_optimize,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -495,9 +517,15 @@ def main():
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
+    
+    if args.train_text_encoder:
+        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler
+        )
 
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
@@ -508,7 +536,8 @@ def main():
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if not args.train_text_encoder:
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
     # Create EMA for the unet.
@@ -542,6 +571,7 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
+    text_enc_context = nullcontext() if args.train_text_encoder else torch.no_grad()
 
     for epoch in range(args.num_train_epochs):
         unet.train()
@@ -564,7 +594,8 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                with text_enc_context:
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual and compute loss
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -603,6 +634,11 @@ def main():
         unet = accelerator.unwrap_model(unet)
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
+
+        if args.train_text_encoder:
+            text_encoder = accelerator.unwrap_model(text_encoder)
+        else:
+            text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", use_auth_token=True)
 
         pipeline = StableDiffusionPipeline(
             text_encoder=text_encoder,
